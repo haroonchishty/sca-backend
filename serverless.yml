@@ -1,0 +1,360 @@
+service: sca-backend
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  region: eu-west-1  # Choose your region
+  environment:
+    STAGE: dev
+    # Reference the stripe-secret-key inside the api-keys secret
+    STRIPE_SECRET_KEY: ${self:custom.secretKeys.stripe-secret-key}
+    # Add Cognito environment variables
+    COGNITO_USER_POOL_ID: ${self:custom.cognitoUserPoolId}
+    COGNITO_CLIENT_ID: ${self:custom.cognitoClientId}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+              - dynamodb:DescribeTable
+              - dynamodb:Query
+              - dynamodb:Scan
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+          Resource: 
+            - arn:aws:dynamodb:eu-west-1:*:*
+        # Only need access to the api-keys secret
+        - Effect: Allow
+          Action:
+            - secretsmanager:GetSecretValue
+          Resource:
+            - arn:aws:secretsmanager:eu-west-1:940482425324:secret:api-keys-*
+
+plugins:
+  - serverless-webpack
+
+custom:
+  stage: dev
+  webpack:
+    webpackConfig: ./webpack.config.js
+    includeModules:
+      forceExclude:
+        - aws-sdk
+    packager: 'npm'
+  secretKeys: ${ssm:/aws/reference/secretsmanager/api-keys}
+  corsConfig:
+      origin: '*'
+      headers:
+          - Authorization
+          - Content-Type
+          - X-Token
+          - X-Api-Key
+          - Channel
+          - Store
+      allowCredentials: false
+  # Add Cognito configuration
+  # cognitoUserPoolId: eu-west-1_Oy9fHpTYD  # Replace with your actual User Pool ID
+  # cognitoClientId: 4245qg8nfr209bakgtj7vogai4  # Replace with your actual Client ID
+  cognitoUserPoolId: !Ref UserPool
+  cognitoClientId: !Ref UserPoolClient
+
+
+functions:
+  createCase:
+    handler: src/case/createCase.handler
+    events:
+      - http:
+          path: cases
+          method: post
+          cors: ${self:custom.corsConfig}
+  uploadImage:
+    handler: src/case/uploadImage.handler
+    events:
+      - http:
+          path: cases/image
+          method: post
+          cors: true
+  getCases:
+    handler: src/case/getCases.handler
+    events:
+      - http:
+          path: cases
+          method: get
+          cors: true
+  getCaseById:
+    handler: src/case/getCaseById.handler
+    events:
+      - http:
+          path: cases/{caseId}
+          method: get
+          cors: true
+          # private: true
+          # apiKey: PublicApiKey
+  updateCase:
+    handler: src/case/updateCase.handler
+    events:
+      - http:
+          path: cases/{caseId}
+          method: put
+          cors: true
+  completeCase:
+    handler: src/user/completeCase.handler
+    events:
+      - http:
+          path: user/{userId}/cases/{caseId}
+          method: put
+          cors: true
+  getCompletedCases:
+    handler: src/user/getCompletedCases.handler
+    events:
+      - http:
+          path: user/{userId}/cases
+          method: get
+          cors: true
+
+  createUser:
+    handler: src/user/createUser.handler
+    events:
+      - http:
+          path: user
+          method: post
+          cors: true
+  getUserById:
+    handler: src/user/getUserById.handler
+    events:
+      - http:
+          path: user/{userId}
+          method: get
+          cors: true
+  updateUser:
+    handler: src/user/updateUser.handler
+    events:
+      - http:
+          path: user/{userId}
+          method: put
+          cors: true
+  checkUserExpiry:
+    handler: src/user/checkUserExpiry.handler
+    events:
+      - http:
+          path: user/expiry/{userId}
+          method: get
+          cors: true
+  cancelSubscription:
+    handler: src/user/cancelSubscription.handler
+    events:
+      - http:
+          path: user/cancel/{userId}
+          method: get
+          cors: true
+  stripe:
+    handler: src/webhook/stripe.handler
+    role: StripeLambdaExecutionRole
+    environment:
+      UPDATE_USER_LAMBDA: ${self:service}-${self:custom.stage}-updateUser
+    events:
+      - http:
+          path: stripe/webhook
+          method: post
+          cors: true
+
+package:
+  individually: true
+
+resources:
+  Resources:
+    UserPool:
+      Type: AWS::Cognito::UserPool
+      Properties:
+        UserPoolName: sca-users
+        AutoVerifiedAttributes:
+          - email
+        Policies:
+          PasswordPolicy:
+            MinimumLength: 8
+            RequireUppercase: true
+            RequireLowercase: true
+            RequireNumbers: true
+            RequireSymbols: false
+        Schema:
+          - AttributeDataType: String
+            Name: email
+            Required: true
+            Mutable: false
+          - AttributeDataType: String
+            Name: name
+            Required: true
+            Mutable: true
+          - Name: isAdmin
+            AttributeDataType: String # Custom attribute (must be a string)
+            Mutable: true  # Allows updating after user creation
+
+    UserPoolClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        ClientName: sca-users-client
+        GenerateSecret: false
+        UserPoolId:
+          Ref: UserPool
+        ExplicitAuthFlows:
+          - ADMIN_NO_SRP_AUTH
+          - USER_PASSWORD_AUTH
+
+    CasesTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: Cases
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: caseId
+            AttributeType: S
+          - AttributeName: categoryId
+            AttributeType: S  # For GSI to query by category
+          - AttributeName: tier
+            AttributeType: N  # For GSI to query by tier
+        KeySchema:
+          - AttributeName: caseId
+            KeyType: HASH  # Primary key for individual cases
+        GlobalSecondaryIndexes:
+          - IndexName: GSI_Category
+            KeySchema:
+              - AttributeName: categoryId
+                KeyType: HASH  # Partition key for category-based queries
+              - AttributeName: caseId
+                KeyType: RANGE # Optional sort key for ordering cases in categories
+            Projection:
+              ProjectionType: ALL
+          - IndexName: GSI_Tier
+            KeySchema:
+              - AttributeName: tier
+                KeyType: HASH  # Partition key for tier-based queries
+              - AttributeName: caseId
+                KeyType: RANGE  # Sort key for ordering cases by caseId or timestamp
+            Projection:
+              ProjectionType: ALL
+
+    CategoriesTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: Categories
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: categoryId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: categoryId
+            KeyType: HASH  # Primary key, unique identifier for each category
+
+    UsersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: Users
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH  # Partition Key
+
+    # ImageBucket:
+    #   Type: AWS::S3::Bucket
+    #   Properties:
+    #     BucketName: sca-case-images-${self:custom.stage}  # Optional: makes it unique per stage
+    #     CorsConfiguration:
+    #       CorsRules:
+    #         - AllowedHeaders:
+    #             - "*"
+    #           AllowedMethods:
+    #             - PUT
+    #             - POST
+    #             - GET
+    #           AllowedOrigins:
+    #             - "*"
+    #           ExposedHeaders: []
+
+    ServiceUsagePlan:
+      Type: "AWS::ApiGateway::UsagePlan"
+      DependsOn:
+        - "ApiGatewayDeployment${sls:instanceId}"
+      Properties:
+        UsagePlanName: ${self:service}
+        ApiStages:
+          - ApiId:
+              Ref: ApiGatewayRestApi
+            Stage: ${self:custom.stage}
+    PublicServiceUsagePlanKey:
+      Type: "AWS::ApiGateway::UsagePlanKey"
+      DependsOn:
+        - ServiceUsagePlan
+      Properties:
+        KeyId:
+          Fn::ImportValue: PublicApiKey
+        KeyType: API_KEY
+        UsagePlanId:
+          Ref: ServiceUsagePlan
+    PrivateServiceUsagePlanKey:
+      Type: "AWS::ApiGateway::UsagePlanKey"
+      DependsOn:
+        - ServiceUsagePlan
+      Properties:
+        KeyId:
+          Fn::ImportValue: PrivateApiKey
+        KeyType: API_KEY
+        UsagePlanId:
+          Ref: ServiceUsagePlan
+    PublicApiKey:
+        Type: 'AWS::ApiGateway::ApiKey'
+        Properties:
+            Name: PublicApiKey
+            Description: Public Api Key
+            Enabled: true
+            Value: ${self:custom.secretKeys.public}
+            StageKeys:
+                - RestApiId:
+                      Ref: ApiGatewayRestApi
+                  StageName: ${self:custom.stage}
+    PrivateApiKey:
+      Type: 'AWS::ApiGateway::ApiKey'
+      Properties:
+          Name: PrivateApiKey
+          Description: Private Api Key
+          Enabled: true
+          Value: ${self:custom.secretKeys.private}
+          StageKeys:
+              - RestApiId:
+                    Ref: ApiGatewayRestApi
+                StageName: ${self:custom.stage}
+    StripeLambdaExecutionRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: stripe-lambda-execution-role
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: lambda.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: LambdaInvokePolicy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - lambda:InvokeFunction
+                  Resource: arn:aws:lambda:eu-west-1:940482425324:function:sca-backend-dev-updateUser
+  Outputs:
+    PublicApiKey:
+        Value:
+            Ref: PublicApiKey
+        Export:
+            Name: PublicApiKey
+    PrivateApiKey:
+        Value:
+            Ref: PrivateApiKey
+        Export:
+            Name: PrivateApiKey
