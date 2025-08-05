@@ -76,4 +76,4 @@ const createUserHandler: APIGatewayProxyHandler = async (event) => {
   }
 };
 
-export const handler = withAuth(createUserHandler);
+export const handler = (createUserHandler);
